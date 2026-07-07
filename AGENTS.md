@@ -1,72 +1,103 @@
-</extremely important>
+# Slurm HPC Execution Policy
+You are operating on a Slurm-managed HPC cluster. Follow this policy for ALL execution. Goal: complete tasks as fast as possible while preserving reliability, efficiency, and fair cluster usage.
 
-- **Any command that executes user code, tests, binaries, or scripts must run through Slurm.**
+---
 
-- **Local shell use is allowed for lightweight actions such as reading, editing, or writing files, obtaining data file header information (e.g., ncdump -h, etc.), downloading and installing environments/packages (e.g., pip install, conda create/install, module load, etc.). Any testing, calculations, or other heavy-load tasks must go through srun or sbatch.**
+## 0. Hard rules — non-negotiable
 
-- Forbidden outside Slurm: `python`, `pytest`, `python -m pytest`, `make test`, `ctest`, `npm test`, `uv run`, `poetry run`, and any other direct script/test/program execution.
+1. **Every execution of user code, tests, binaries, or scripts MUST go through Slurm** (`srun` / `sbatch`).
+   Forbidden on the login node: `python`, `pytest`, `python -m pytest`, `make test`, `ctest`, `npm test`, `uv run`, `poetry run`, `./binary`, any `bash script.sh` that performs computation, and any other direct execution.
+2. **The login node (local shell) is only for lightweight, non-compute work**:
+   - reading / editing / writing files; metadata peeks (`ls`, `head`, `wc -l`, `ncdump -h`, `h5ls`);
+   - **all network work**: `pip install`, `conda create/install`, `git clone`, `wget`/`curl`, dataset downloads, `module load`. Compute nodes may have no internet — finish every download and install on the login node **before** submitting jobs.
+3. **Print the full Slurm command immediately before executing it.**
+4. **Never fall back to local execution** because Slurm is inconvenient or a job failed. Diagnose (`squeue`, `sacct`, `.err` files) and resubmit.
 
-- Before any execution, always inspect resources with:
-  `sinfo -h -O Partition,Available,StateLong,CPUs,Memory,Gres,Time`
+## 1. Standard workflow
 
-- Default to CPU. Use GPU only when the task uses CUDA/GPU (e.g., torch.cuda, TensorFlow GPU, JAX GPU, CUDA-dependent code).
+1. **Inspect the cluster** (at session start; refresh before any large submission):
+   ```bash
+   sinfo -h -O 'Partition:18,Available:6,StateLong:12,CPUs:6,Memory:10,Gres:14,Time:12'
+   sinfo -N -h -O 'NodeList:12,Partition:16,StateLong:12,CPUsState:14,Memory:10'
+   ```
+   `CPUsState` prints `alloc/idle/other/total` per node — use idle counts to size requests and to confirm node03/node04 availability.
+2. **Classify the task**: small → `srun` (§3); large → `sbatch` (§4).
+   Large = expected runtime > 15 min, multi-step orchestration, or heavy CPU/GPU/memory needs.
+3. **Size resources** per §2. If queue/start time matters, probe candidate configs first:
+   `srun --test-only ...` or `sbatch --test-only job.sh`
+4. **Submit → monitor → verify** (§5). Iterate fast (§6).
 
-- Allocate compute resources to optimize time-to-result while preserving reliability, efficiency, and fair cluster usage. Base the request on the workload’s demonstrated or expected CPU/GPU scalability, memory needs, I/O behavior, and queue/start-time tradeoffs. Do not under-request resources in a way that risks failure or excessive runtime, and do not over-request resources the job cannot efficiently use.
+## 2. Resource sizing — optimize time-to-result
 
-- If suitable compute nodes are idle or likely to start quickly, consider increasing the requested CPU, memory, node, or GPU resources to a reasonably high level that the workload is expected to use efficiently, so the task can complete faster without clearly wasteful over-allocation or undue impact on other users.
+- **CPU by default.** Request GPU (`--gres=gpu:1`) only when the code actually uses it (`torch.cuda`, TensorFlow/JAX GPU, CUDA kernels).
+- **Idle-cluster baseline = 32 cores.** When idle CPU nodes exist and the workload can scale, request **at least 32 cores** so tasks finish quickly — and make the workload actually use them:
+  - tests: `python -m pytest -n <CPUS>` (pytest-xdist; match the `-c` value; install it on the login node)
+  - Python: dask / joblib / multiprocessing with workers = allocated cores
+  - numeric libs: `export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK` (already in the §4 template)
+  Only drop below 32 cores for inherently serial tasks that cannot be parallelized quickly.
+- **Upper bound**: never request more than the code can efficiently use. **Lower bound**: never so little that OOM or timeout becomes likely.
+- **Prefer node03 / node04 for CPU-only jobs when idle**: `-w node03` (srun) or `#SBATCH --nodelist=node03`.
+- **Walltime = shortest realistic estimate + ~50% buffer.** Tight limits start sooner via backfill and cap runaway jobs.
+- **Memory**: estimate from input size + working set, add a buffer; take whole-node memory only when truly needed.
 
-- If multiple independent, non-conflicting tasks exist and can run concurrently, prefer submitting them as separate Slurm jobs or as a Slurm job array so they execute in parallel rather than sequentially.
+## 3. Small tasks → `srun`
 
-- Print the full Slurm command immediately before executing it.
+Smoke tests, unit tests, quick validation, short debugging, single commands (expected < 15 min):
 
-- When writing and optimizing computational scripts, prioritize efficient algorithms and parallel computing tools suited to **HPC environments** such as **dask** and other parallel computing frameworks to improve **computational efficiency**, **resource utilization**, and **scalability**.
+```bash
+srun -p <PARTITION> -n 1 -c <CPUS> --mem=<MEM> -t <TIME> [-w node03] <command>
+# e.g.
+srun -p cpu -n 1 -c 32 --mem=32G -t 00:10:00 -w node03 python -m pytest -n 32 tests/
+```
 
-- Never fall back to local execution because Slurm is inconvenient.
+## 4. Large tasks → `sbatch`
 
-- Use `srun` for small tasks: smoke tests, unit tests, quick validation, short debugging, single-command runs.
+Expected > 15 min, multi-step pipelines, full benchmarks, training, data generation, heavy full-suite tests.
 
-  Template:
-  `srun -p <PARTITION> -n 1 -c <CPUS> --mem=<MEM> -t <TIME> <command>`
+```bash
+#!/bin/bash
+#SBATCH --job-name=<JOB_NAME>
+#SBATCH --partition=<PARTITION>
+#SBATCH --nodes=1
+#SBATCH --ntasks=<NTASKS>              # 1 unless MPI
+#SBATCH --cpus-per-task=<CPUS>
+#SBATCH --mem=<MEM>
+#SBATCH --time=<TIME>
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
+##SBATCH --account=<ACCOUNT>           # uncomment if the cluster requires accounting
+##SBATCH --nodelist=node03             # idle node03/node04 preferred for CPU work
+##SBATCH --gres=gpu:1                  # GPU jobs only
+##SBATCH --array=0-9%4                 # N independent shards, <=4 concurrent; then use --output=%x-%A_%a.out
 
-- Use `sbatch job.sh` for large tasks: expected runtime >15 minutes, multi-step pipelines, full benchmarks, training, data generation, or heavy full-suite tests.
+set -euo pipefail
+cd "$SLURM_SUBMIT_DIR"
 
-  If queue/start-time matters, probe candidate configs first with:
-  `srun --test-only ...`
-  or
-  `sbatch --test-only job.sh`
+# Environment (all installs/downloads were already done on the login node)
+# source ~/miniconda3/etc/profile.d/conda.sh && conda activate <ENV>
+# module load <MODULES>
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 
-- `job.sh` template:
+<run command>
+# MPI:       srun -n "$SLURM_NTASKS" ../bld/cesm.exe >& run.log
+# Job array: python process.py --shard "$SLURM_ARRAY_TASK_ID"
+```
 
-  ```bash
-  #!/bin/bash
-  #SBATCH --job-name=<JOB_NAME>
-  #SBATCH --account=<ACCOUNT>
-  #SBATCH --partition=<PARTITION>
-  #SBATCH --nodes=1
-  #SBATCH --ntasks-per-node=<NTASKS>
-  #SBATCH --error=%j.err
-  #SBATCH --time=<TIME>
-  
-  cd "$SLURM_SUBMIT_DIR"
-  
-  <run command>
-  # e.g.
-  # mpirun -np <NTASKS> ../bld/cesm.exe >& run.log
-  ```
+Adapt the script to the actual workload and **fill every `<...>` placeholder — never execute a command or script that still contains one.**
 
-- Adjust `job.sh` to the actual workload. Do not leave placeholders in executed commands.
+## 5. Monitor, verify, iterate
 
-</extremely important>
+- Record the job ID from `sbatch` output. Poll gently — `sleep` 20–60 s between checks, never a tight loop:
+  `squeue -j <JOBID> -h -o '%T %M %R'`
+- Peek at early output: `tail -n 50 <JOB_NAME>-<JOBID>.out <JOB_NAME>-<JOBID>.err`. If the job is clearly failing, `scancel <JOBID>` immediately — do not let a doomed job burn its walltime.
+- On completion:
+  `sacct -j <JOBID> -o JobID,State,ExitCode,Elapsed,MaxRSS,ReqCPUS`
+  Success = `COMPLETED` + exit code 0 **and** the output files contain the expected results. Use `MaxRSS` / `Elapsed` to right-size the next submission.
+- On failure: read the `.err` file, fix, resubmit. Debug by rerunning the failing command through a short `srun` if needed.
 
-## Slurm workflow
+## 6. Go faster
 
-- First run:
-  `sinfo -h -O Partition,Available,StateLong,CPUs,Memory,Gres,Time`
-- Then classify the task:
-  - Small task -> `srun`
-  - Large task -> `sbatch`
-- Treat a task as large if it is expected to run >15 minutes, needs multi-step orchestration, or requires heavy CPU/GPU/memory.
-- Prefer CPU unless the workload requires GPU/CUDA.
-- Use the most suitable allocation.
-- If multiple configs are plausible and queue/start-time matters, test them with `--test-only` before real submission.
-- Never execute the workload directly outside Slurm.
+- **Smoke-test before the big run**: validate the logic on a tiny subset via a 1–2 min `srun` before queueing a long `sbatch`. A one-minute test saves an hour-long failed job.
+- **Fan out independent work**: multiple independent, non-conflicting tasks go out as separate parallel `sbatch` jobs or one job array (`--array`) — never run them sequentially.
+- **Write parallel code**: when authoring or optimizing computational scripts, prefer HPC-suited parallel frameworks (dask, joblib, multiprocessing, mpi4py, numba, pytest-xdist) so the allocated cores are fully used and the solution scales.
+- **Match the queue**: idle cluster → scale requests up to the workload's efficient limit; busy cluster → smaller core counts + tighter walltime slot into backfill gaps and start sooner. Compare start times with `--test-only` when unsure.
